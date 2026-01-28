@@ -9,12 +9,17 @@ import argparse
 import sys
 from pathlib import Path
 from datetime import datetime
+import threading
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
 from data.weather_generator import WeatherGenerator
 from data.scada_generator import SCADAGenerator
+from twin.simulator import Simulator, SimulationMode
+from twin.persistence import CheckpointManager
+from interface.cli_dashboard import CLIDashboard
+import pandas as pd
 
 
 def generate_data(args):
@@ -110,6 +115,144 @@ def show_stats(args):
     print("   jupyter notebook notebooks/exploration.ipynb")
 
 
+def simulate(args):
+    """Run digital twin simulation."""
+    print(f"🌀 WINDTWIN-AI: Starting Simulation")
+    print(f"   Duration: {args.days} days")
+    print(f"   Mode: {args.mode}")
+    if args.mode == 'fast':
+        print(f"   Speed: {args.speed}x")
+    print()
+    
+    # Generate or load weather data
+    print("📡 Generating weather data...")
+    weather_gen = WeatherGenerator(seed=args.seed)
+    weather_data = weather_gen.generate(
+        start_date=args.start_date,
+        days=args.days,
+        interval_minutes=10
+    )
+    print(f"   ✓ Generated {len(weather_data)} weather samples")
+    print()
+    
+    # Create simulator
+    print("⚙️  Initializing simulator...")
+    
+    # Check if forecast model exists and load if requested
+    forecaster_path = None
+    if args.forecast:
+        from pathlib import Path
+        default_model = Path("models/power_forecast_1h.pkl")
+        if default_model.exists():
+            forecaster_path = str(default_model)
+        else:
+            print("⚠️  Warning: Forecast model not found at models/power_forecast_1h.pkl")
+            print("   Run demo to train a model first, or disable --forecast flag")
+            print()
+    
+    simulator = Simulator(weather_data, forecaster_path=forecaster_path)
+    print(f"   ✓ Turbine: {simulator.config.turbine.name}")
+    print(f"   ✓ Rated Power: {simulator.config.turbine.rated_power_kw} kW")
+    if simulator.forecast_enabled:
+        print(f"   ✓ Forecast: Enabled (1h ahead)")
+    print()
+    
+    # Setup checkpoint manager if enabled
+    checkpoint_manager = None
+    if args.checkpoint:
+        checkpoint_manager = CheckpointManager()
+        print("💾 Auto-checkpoint enabled")
+        print()
+    
+    # Determine simulation mode
+    if args.mode == 'realtime':
+        mode = SimulationMode.REALTIME
+        speed = args.speed
+    elif args.mode == 'fast':
+        mode = SimulationMode.FAST
+        speed = args.speed
+    else:
+        mode = SimulationMode.STEP
+        speed = 1.0
+    
+    # Run with or without dashboard
+    if args.dashboard:
+        print("🖥️  Launching dashboard...")
+        print("   (Press Ctrl+C to stop)")
+        print()
+        
+        # Create dashboard
+        dashboard = CLIDashboard(simulator, refresh_rate=1.0)
+        
+        # Start simulation in background thread
+        def run_simulation():
+            simulator.run(mode=mode, speed_multiplier=speed)
+        
+        sim_thread = threading.Thread(target=run_simulation, daemon=True)
+        sim_thread.start()
+        
+        # Run dashboard (blocks until stopped)
+        try:
+            dashboard.run()
+        except KeyboardInterrupt:
+            print("\n\nStopping simulation...")
+            simulator.stop()
+        
+        # Show summary
+        dashboard.display_summary()
+        
+    else:
+        # Run without dashboard
+        print("▶️  Running simulation...")
+        simulator.run(mode=mode, speed_multiplier=speed)
+        
+        # Show summary
+        summary = simulator.get_summary()
+        print("\n✅ Simulation Complete!")
+        print(f"   Time simulated: {summary['simulation_time_h']:.2f} hours")
+        print(f"   Energy produced: {summary['total_energy_mwh']:.1f} MWh")
+        print(f"   Capacity factor: {summary['capacity_factor']:.1%}")
+        print(f"   Availability: {summary['availability']:.1%}")
+    
+    # Save checkpoint if requested
+    if checkpoint_manager and args.checkpoint:
+        checkpoint_id = checkpoint_manager.save_checkpoint(
+            simulator,
+            metadata={'cli_run': True, 'days': args.days}
+        )
+        print(f"\n💾 Checkpoint saved: {checkpoint_id}")
+
+
+def show_stats(args):
+    """Display statistics for existing data."""
+    print("📊 WINDTWIN-AI: Data Statistics")
+    print()
+    
+    # Check for data files
+    weather_dir = Path("data/weather")
+    scada_dir = Path("data/scada")
+    
+    weather_files = list(weather_dir.glob("*.csv")) if weather_dir.exists() else []
+    scada_files = list(scada_dir.glob("*.csv")) if scada_dir.exists() else []
+    
+    if not weather_files and not scada_files:
+        print("❌ No data found. Generate data first with:")
+        print("   python main.py generate --days 7")
+        return
+    
+    print(f"Weather files: {len(weather_files)}")
+    for f in weather_files:
+        print(f"   - {f.name}")
+    
+    print(f"\nSCADA files: {len(scada_files)}")
+    for f in scada_files:
+        print(f"   - {f.name}")
+    
+    print()
+    print("💡 Use Jupyter notebook to explore data:")
+    print("   jupyter notebook notebooks/exploration.ipynb")
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -169,6 +312,55 @@ Examples:
     # Stats command
     stats_parser = subparsers.add_parser('stats', help='Show data statistics')
     
+    # Simulate command
+    sim_parser = subparsers.add_parser('simulate', help='Run digital twin simulation')
+    sim_parser.add_argument(
+        '--days',
+        type=int,
+        default=1,
+        help='Number of days to simulate (default: 1)'
+    )
+    sim_parser.add_argument(
+        '--start-date',
+        type=str,
+        default='2024-01-01',
+        help='Start date (YYYY-MM-DD, default: 2024-01-01)'
+    )
+    sim_parser.add_argument(
+        '--mode',
+        type=str,
+        choices=['realtime', 'fast', 'step'],
+        default='realtime',
+        help='Simulation mode (default: realtime)'
+    )
+    sim_parser.add_argument(
+        '--speed',
+        type=float,
+        default=1.0,
+        help='Speed multiplier for fast mode (default: 1.0)'
+    )
+    sim_parser.add_argument(
+        '--dashboard',
+        action='store_true',
+        help='Show live dashboard'
+    )
+    sim_parser.add_argument(
+        '--checkpoint',
+        action='store_true',
+        help='Enable auto-checkpoint'
+    )
+    sim_parser.add_argument(
+        '--seed',
+        type=int,
+        default=None,
+        help='Random seed for reproducibility (default: None)'
+    )
+    sim_parser.add_argument(
+        '--forecast',
+        action='store_true',
+        help='Enable real-time power forecasting (requires trained model)'
+    )
+    
     # Parse arguments
     args = parser.parse_args()
     
@@ -177,6 +369,8 @@ Examples:
         generate_data(args)
     elif args.command == 'stats':
         show_stats(args)
+    elif args.command == 'simulate':
+        simulate(args)
     else:
         parser.print_help()
 

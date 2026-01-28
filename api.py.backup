@@ -1,0 +1,729 @@
+"""
+FastAPI Web API for WindTwin Digital Twin - Phase 5
+
+Thin adapter layer that exposes simulator data via REST API.
+Does NOT modify simulator - read-only data access.
+
+Phase 5.1: Real-time simulation loop added - advances every 5 minutes.
+"""
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta
+from pathlib import Path
+from contextlib import asynccontextmanager
+import uvicorn
+import sys
+import asyncio
+import threading
+
+# Add src to path
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+
+from twin.state import TurbineState, OperationalStatus
+from twin.simulator import Simulator
+from twin.events import Event, EventType, EventSeverity
+from data.weather_generator import WeatherGenerator
+from data.continuous_weather import ContinuousWeatherGenerator  # v1.0
+
+
+# ============================================================================
+# Pydantic Response Models
+# ============================================================================
+
+class CurrentStateResponse(BaseModel):
+    """Current turbine state."""
+    timestamp: datetime
+    power_kw: float
+    rotor_speed_rpm: float
+    status: str
+    wind_speed_ms: float
+    wind_direction_deg: float
+    ambient_temp_c: float
+    generator_temp_c: float
+    gearbox_temp_c: float
+    bearing_temp_c: float
+    vibration_mms: float
+    total_energy_mwh: float
+    operating_hours: float
+    capacity_factor: float
+    availability: float
+    is_faulted: bool
+    fault_message: Optional[str] = None
+    
+    # Forecast fields
+    forecast_power_1h: Optional[float] = None
+    forecast_available: bool = False
+
+
+class HistoryPoint(BaseModel):
+    """Single point in history."""
+    timestamp: datetime
+    power_kw: float
+    wind_speed_ms: float
+    status: str
+
+
+class HistoryResponse(BaseModel):
+    """Historical data response."""
+    window: str
+    count: int
+    data: List[HistoryPoint]
+
+
+class ForecastResponse(BaseModel):
+    """Power forecast response."""
+    current_power_kw: float
+    forecast_power_1h: Optional[float]
+    delta_kw: Optional[float]
+    delta_percent: Optional[float]
+    trend: str  # "up", "down", "stable"
+    available: bool
+    timestamp: datetime
+
+
+class EventResponse(BaseModel):
+    """Event log entry."""
+    timestamp: datetime
+    type: str
+    severity: str
+    message: str
+
+
+class MaintenanceRecommendation(BaseModel):
+    """Maintenance recommendation."""
+    component: str
+    priority: str  # "low", "medium", "high", "critical"
+    message: str
+    reason: str
+
+
+class MaintenanceResponse(BaseModel):
+    """Maintenance recommendations."""
+    recommendations: List[MaintenanceRecommendation]
+    next_scheduled: Optional[datetime] = None
+
+
+class HealthResponse(BaseModel):
+    """API health check."""
+    status: str
+    simulator_running: bool
+    forecast_enabled: bool
+    uptime_seconds: float
+
+
+# ============================================================================
+# Global Simulator Instance
+# ============================================================================
+
+# This will be initialized when the API starts
+_simulator: Optional[Simulator] = None
+_start_time: datetime = datetime.now()
+
+# Phase 5.1: Real-time simulation control
+_shutdown_event: Optional[threading.Event] = None
+_simulation_thread: Optional[threading.Thread] = None
+
+# v1.0: Continuous weather and drift-safe timing
+_continuous_weather: Optional[ContinuousWeatherGenerator] = None
+_next_tick_time: Optional[datetime] = None
+_tick_interval_seconds = 300  # 5 minutes
+
+
+def get_simulator() -> Simulator:
+    """Get the global simulator instance."""
+    if _simulator is None:
+        raise HTTPException(status_code=503, detail="Simulator not initialized")
+    return _simulator
+
+
+# ============================================================================
+# Phase 5.1 / v1.0: Real-Time Simulation Loop with Drift-Safe Scheduling
+# ============================================================================
+
+def simulation_loop():
+    """
+    Background thread that advances simulation in real-time (v1.0).
+    
+    v1.0 Enhancements:
+    - Drift-safe scheduling (wall-clock based, not cumulative sleep)
+    - Continuous weather generation (smooth transitions)
+    - Missed tick detection and logging
+    - Robust error handling (clamp bad values, never crash)
+    
+    Timing:
+    - Fixed 5-minute intervals based on wall clock
+    - If a tick is missed, log it but don't stack
+    - Sleeps only until next scheduled tick
+    
+    Shutdown:
+    - Checks shutdown_event every second
+    - Exits cleanly when event is set
+    """
+    global _simulator, _shutdown_event, _continuous_weather, _next_tick_time
+    
+    print("🔄 v1.0 Simulation loop started (drift-safe, 5-minute intervals)")
+    
+    # Initialize next tick time
+    _next_tick_time = datetime.now() + timedelta(seconds=_tick_interval_seconds)
+    last_tick_time = datetime.now()
+    
+    while _simulator and _shutdown_event and not _shutdown_event.is_set():
+        # Calculate time until next tick (drift-safe)
+        now = datetime.now()
+        time_until_tick = (_next_tick_time - now).total_seconds()
+        
+        # Check if we missed a tick
+        if time_until_tick < 0:
+            missed_seconds = abs(time_until_tick)
+            if missed_seconds > 10:  # More than 10 seconds late
+                print(f"⚠ Missed tick by {missed_seconds:.1f}s - adjusting schedule")
+            # Don't stack missed ticks - just move to next interval
+            _next_tick_time = now + timedelta(seconds=_tick_interval_seconds)
+            time_until_tick = _tick_interval_seconds
+        
+        # Sleep until next tick (check shutdown every second)
+        seconds_to_wait = max(1, int(time_until_tick))
+        for _ in range(seconds_to_wait):
+            if _shutdown_event.is_set():
+                break
+            _shutdown_event.wait(1)
+        
+        # If shutdown was requested during sleep, exit
+        if _shutdown_event.is_set():
+            break
+        
+        # Check if it's time for the tick
+        now = datetime.now()
+        if now < _next_tick_time:
+            continue  # Not yet time, loop again
+        
+        # Advance simulation by one step
+        try:
+            # Generate next weather sample (continuous, smooth)
+            next_weather = _continuous_weather.get_next_sample(_simulator.current_time)
+            
+            # Inject weather into simulator's weather data
+            # (simulator expects weather_data DataFrame with current index)
+            if _simulator.weather_index < len(_simulator.weather_data):
+                # Update the current weather row with smooth values
+                idx = _simulator.weather_index
+                _simulator.weather_data.loc[idx, 'wind_speed_ms'] = next_weather['wind_speed_ms']
+                _simulator.weather_data.loc[idx, 'wind_direction_deg'] = next_weather['wind_direction_deg']
+                _simulator.weather_data.loc[idx, 'temperature_c'] = next_weather['temperature_c']
+                _simulator.weather_data.loc[idx, 'air_density_kgm3'] = next_weather['air_density_kgm3']
+            
+            # Advance simulator
+            _simulator.step()
+            
+            # Get current state
+            current_state = _simulator.state_manager.current_state
+            if current_state:
+                elapsed = (now - last_tick_time).total_seconds()
+                print(f"✓ Tick: {current_state.timestamp.strftime('%H:%M:%S')} | "
+                      f"Power: {current_state.power_output_kw:.0f}kW | "
+                      f"Wind: {current_state.wind_speed_ms:.1f}m/s | "
+                      f"Status: {current_state.status.value} | "
+                      f"Δt: {elapsed:.1f}s")
+                last_tick_time = now
+        
+        except Exception as e:
+            print(f"⚠ Error in simulation step: {e}")
+            # Don't crash - continue to next tick
+        
+        # Schedule next tick (drift-safe)
+        _next_tick_time += timedelta(seconds=_tick_interval_seconds)
+    
+    print("🛑 Simulation loop stopped")
+
+
+def start_simulation_loop():
+    """Start the background simulation thread."""
+    global _simulation_thread, _shutdown_event
+    
+    _shutdown_event = threading.Event()
+    _simulation_thread = threading.Thread(target=simulation_loop, daemon=False)
+    _simulation_thread.start()
+
+
+def stop_simulation_loop():
+    """Stop the background simulation thread cleanly."""
+    global _simulation_thread, _shutdown_event
+    
+    if _shutdown_event:
+        print("🛑 Requesting simulation loop shutdown...")
+        _shutdown_event.set()
+    
+    if _simulation_thread and _simulation_thread.is_alive():
+        _simulation_thread.join(timeout=5)
+        if _simulation_thread.is_alive():
+            print("⚠ Simulation thread did not stop in time")
+        else:
+            print("✓ Simulation thread stopped cleanly")
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def state_to_response(state: TurbineState, simulator: Simulator) -> CurrentStateResponse:
+    """
+    Convert TurbineState to API response (v1.0 with value clamping).
+    
+    v1.0 Enhancements:
+    - Clamps all values to valid ranges
+    - Ensures enums are always strings
+    - Never returns invalid data
+    """
+    try:
+        capacity_factor = simulator.state_manager.calculate_capacity_factor()
+        availability = simulator.state_manager.calculate_availability()
+    except Exception as e:
+        print(f"⚠ Error calculating metrics: {e}")
+        capacity_factor = 0.0
+        availability = 1.0
+    
+    # Clamp values to valid ranges (v1.0 stability)
+    def clamp(value: float, min_val: float, max_val: float) -> float:
+        return max(min_val, min(max_val, value))
+    
+    return CurrentStateResponse(
+        timestamp=state.timestamp,
+        power_kw=clamp(state.power_output_kw, 0.0, 10000.0),  # Max 10MW
+        rotor_speed_rpm=clamp(state.rotor_speed_rpm, 0.0, 50.0),  # Max 50 RPM
+        status=state.status.value if hasattr(state.status, 'value') else str(state.status),
+        wind_speed_ms=clamp(state.wind_speed_ms, 0.0, 50.0),  # Max 50 m/s
+        wind_direction_deg=state.wind_direction_deg % 360,  # Wrap to 0-360
+        ambient_temp_c=clamp(state.ambient_temp_c, -50.0, 50.0),  # Reasonable temp range
+        generator_temp_c=clamp(state.generator_temp_c, -50.0, 200.0),  # Max 200°C
+        gearbox_temp_c=clamp(state.gearbox_temp_c, -50.0, 200.0),
+        bearing_temp_c=clamp(state.bearing_temp_c, -50.0, 200.0),
+        vibration_mms=clamp(state.vibration_mms, 0.0, 50.0),  # Max 50 mm/s
+        total_energy_mwh=max(0.0, state.total_energy_mwh),  # Energy never negative
+        operating_hours=max(0.0, state.operating_hours),
+        capacity_factor=clamp(capacity_factor, 0.0, 1.0),
+        availability=clamp(availability, 0.0, 1.0),
+        is_faulted=bool(state.is_faulted),
+        fault_message=state.fault_message,
+        forecast_power_1h=clamp(state.forecast_power_1h, 0.0, 10000.0) if state.forecast_power_1h else None,
+        forecast_available=bool(state.forecast_available)
+    )
+
+
+def calculate_forecast_trend(current: float, forecast: Optional[float]) -> str:
+    """Calculate trend from current to forecast."""
+    if forecast is None:
+        return "unknown"
+    
+    delta = forecast - current
+    
+    if abs(delta) < 50:  # Less than 50 kW change
+        return "stable"
+    elif delta > 0:
+        return "up"
+    else:
+        return "down"
+
+
+def get_maintenance_recommendations(state: TurbineState) -> List[MaintenanceRecommendation]:
+    """Generate maintenance recommendations based on state."""
+    recommendations = []
+    
+    # Temperature checks
+    if state.generator_temp_c > 100:
+        recommendations.append(MaintenanceRecommendation(
+            component="Generator",
+            priority="high",
+            message="Generator temperature exceeds safe operating limit",
+            reason=f"Temperature: {state.generator_temp_c:.1f}°C (limit: 110°C)"
+        ))
+    elif state.generator_temp_c > 90:
+        recommendations.append(MaintenanceRecommendation(
+            component="Generator",
+            priority="medium",
+            message="Generator temperature approaching limit",
+            reason=f"Temperature: {state.generator_temp_c:.1f}°C (warning: 90°C)"
+        ))
+    
+    if state.gearbox_temp_c > 90:
+        recommendations.append(MaintenanceRecommendation(
+            component="Gearbox",
+            priority="high",
+            message="Gearbox temperature exceeds safe operating limit",
+            reason=f"Temperature: {state.gearbox_temp_c:.1f}°C (limit: 100°C)"
+        ))
+    elif state.gearbox_temp_c > 80:
+        recommendations.append(MaintenanceRecommendation(
+            component="Gearbox",
+            priority="medium",
+            message="Gearbox temperature elevated",
+            reason=f"Temperature: {state.gearbox_temp_c:.1f}°C (warning: 80°C)"
+        ))
+    
+    # Vibration checks
+    if state.vibration_mms > 7:
+        recommendations.append(MaintenanceRecommendation(
+            component="Bearings",
+            priority="critical",
+            message="Excessive vibration detected",
+            reason=f"Vibration: {state.vibration_mms:.2f} mm/s (critical: 7 mm/s)"
+        ))
+    elif state.vibration_mms > 5:
+        recommendations.append(MaintenanceRecommendation(
+            component="Bearings",
+            priority="medium",
+            message="Elevated vibration levels",
+            reason=f"Vibration: {state.vibration_mms:.2f} mm/s (warning: 5 mm/s)"
+        ))
+    
+    # Operating hours checks
+    if state.operating_hours > 8000:
+        recommendations.append(MaintenanceRecommendation(
+            component="Gearbox",
+            priority="low",
+            message="Scheduled maintenance due",
+            reason=f"Operating hours: {state.operating_hours:.0f}h (service interval: 8000h)"
+        ))
+    
+    return recommendations
+
+
+# ============================================================================
+# FastAPI App with Lifespan Management (Phase 5.1)
+# ============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Lifespan context manager for FastAPI.
+    
+    Startup:
+    - Initializes simulator
+    - Starts background simulation loop
+    
+    Shutdown:
+    - Stops simulation loop cleanly
+    """
+    # Startup
+    print("=" * 70)
+    print("FastAPI Startup: Initializing simulator and background loop")
+    print("=" * 70)
+    
+    # Simulator is initialized in initialize_simulator() before uvicorn.run()
+    # Start the real-time simulation loop
+    start_simulation_loop()
+    
+    yield  # Server runs here
+    
+    # Shutdown
+    print("\n" + "=" * 70)
+    print("FastAPI Shutdown: Stopping simulation loop")
+    print("=" * 70)
+    stop_simulation_loop()
+
+
+app = FastAPI(
+    title="WindTwin API",
+    description="Web API for Wind Turbine Digital Twin Monitoring",
+    version="1.0.0",
+    lifespan=lifespan  # Phase 5.1: Add lifespan management
+)
+
+# CORS middleware for local development
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify allowed origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================================
+# API Endpoints
+# ============================================================================
+
+@app.get("/", tags=["Root"])
+async def root():
+    """Root endpoint - redirects to docs."""
+    return {
+        "message": "WindTwin API - Phase 5",
+        "docs": "/docs",
+        "health": "/api/health"
+    }
+
+
+@app.get("/api/health", response_model=HealthResponse, tags=["Health"])
+async def health():
+    """Health check endpoint."""
+    sim = get_simulator()
+    uptime = (datetime.now() - _start_time).total_seconds()
+    
+    return HealthResponse(
+        status="ok",
+        simulator_running=sim.is_running,
+        forecast_enabled=sim.forecast_enabled,
+        uptime_seconds=uptime
+    )
+
+
+@app.get("/api/state/current", response_model=CurrentStateResponse, tags=["State"])
+async def get_current_state():
+    """
+    Get current turbine state (v1.0 with robust error handling).
+    
+    v1.0 Enhancements:
+    - Never returns 500 for normal operation
+    - Clamps bad values instead of crashing
+    - Always returns valid enum strings
+    """
+    try:
+        sim = get_simulator()
+        state = sim.state_manager.current_state
+        
+        if state is None:
+            raise HTTPException(status_code=404, detail="No current state available")
+        
+        return state_to_response(state, sim)
+    
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions
+    except Exception as e:
+        # v1.0: Never crash - log and return service unavailable
+        print(f"❌ Error in get_current_state: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Temporary error accessing current state - system is recovering"
+        )
+
+
+@app.get("/api/state/history", response_model=HistoryResponse, tags=["State"])
+async def get_state_history(
+    window: str = Query("1h", description="Time window: 1h, 6h, 24h, or 'all'")
+):
+    """Get historical state data."""
+    sim = get_simulator()
+    
+    # Determine number of samples based on window
+    # Assuming 10-minute intervals: 6 per hour
+    window_map = {
+        "1h": 6,
+        "6h": 36,
+        "24h": 144,
+        "all": None
+    }
+    
+    if window not in window_map:
+        raise HTTPException(status_code=400, detail=f"Invalid window: {window}")
+    
+    last_n = window_map[window]
+    history = sim.state_manager.get_history(last_n=last_n)
+    
+    if not history:
+        return HistoryResponse(window=window, count=0, data=[])
+    
+    data = [
+        HistoryPoint(
+            timestamp=state.timestamp,
+            power_kw=state.power_output_kw,
+            wind_speed_ms=state.wind_speed_ms,
+            status=state.status.value
+        )
+        for state in history
+    ]
+    
+    return HistoryResponse(
+        window=window,
+        count=len(data),
+        data=data
+    )
+
+
+@app.get("/api/forecast", response_model=ForecastResponse, tags=["Forecast"])
+async def get_forecast():
+    """Get power forecast."""
+    sim = get_simulator()
+    state = sim.state_manager.current_state
+    
+    if state is None:
+        raise HTTPException(status_code=404, detail="No current state available")
+    
+    current_power = state.power_output_kw
+    forecast_power = state.forecast_power_1h
+    
+    delta_kw = None
+    delta_percent = None
+    
+    if forecast_power is not None:
+        delta_kw = forecast_power - current_power
+        if current_power > 0:
+            delta_percent = (delta_kw / current_power) * 100
+    
+    trend = calculate_forecast_trend(current_power, forecast_power)
+    
+    return ForecastResponse(
+        current_power_kw=current_power,
+        forecast_power_1h=forecast_power,
+        delta_kw=delta_kw,
+        delta_percent=delta_percent,
+        trend=trend,
+        available=state.forecast_available,
+        timestamp=state.timestamp
+    )
+
+
+@app.get("/api/events", response_model=List[EventResponse], tags=["Events"])
+async def get_events(limit: int = Query(10, ge=1, le=100)):
+    """Get recent events."""
+    sim = get_simulator()
+    events = sim.event_processor.get_recent_events(limit)
+    
+    return [
+        EventResponse(
+            timestamp=event.timestamp,
+            type=event.event_type.value if hasattr(event, 'event_type') else str(event.type) if hasattr(event, 'type') else "unknown",
+            severity=event.severity.value if hasattr(event.severity, 'value') else str(event.severity),
+            message=event.message
+        )
+        for event in events
+    ]
+
+
+@app.get("/api/maintenance", response_model=MaintenanceResponse, tags=["Maintenance"])
+async def get_maintenance():
+    """Get maintenance recommendations."""
+    sim = get_simulator()
+    state = sim.state_manager.current_state
+    
+    if state is None:
+        raise HTTPException(status_code=404, detail="No current state available")
+    
+    recommendations = get_maintenance_recommendations(state)
+    
+    # Calculate next scheduled maintenance (every 8000 hours)
+    next_scheduled = None
+    if state.operating_hours > 0:
+        hours_until_next = 8000 - (state.operating_hours % 8000)
+        next_scheduled = datetime.now() + timedelta(hours=hours_until_next)
+    
+    return MaintenanceResponse(
+        recommendations=recommendations,
+        next_scheduled=next_scheduled
+    )
+
+
+# ============================================================================
+# Startup & Run
+# ============================================================================
+
+def initialize_simulator(days: int = 1, forecast: bool = True):
+    """Initialize the global simulator instance (v1.0 enhanced)."""
+    global _simulator, _start_time, _continuous_weather
+    
+    print("=" * 70)
+    print("WindTwin API v1.0 - Initializing Simulator")
+    print("=" * 70)
+    print()
+    
+    # v1.0: Initialize continuous weather generator
+    print("Initializing continuous weather generator...")
+    _continuous_weather = ContinuousWeatherGenerator(seed=42)
+    print("  ✓ Continuous weather ready (smooth transitions enabled)")
+    print()
+    
+    # Generate initial weather data (will be updated continuously)
+    print(f"Generating initial weather data for {days} days...")
+    weather_gen = WeatherGenerator(seed=42)
+    weather_data = weather_gen.generate(
+        start_date="2024-01-01",
+        days=days,
+        interval_minutes=10
+    )
+    print(f"  ✓ Generated {len(weather_data)} weather samples")
+    print()
+    
+    # Create simulator with optional forecasting
+    forecaster_path = None
+    if forecast:
+        model_path = Path("models/power_forecast_1h.pkl")
+        if model_path.exists():
+            forecaster_path = str(model_path)
+            print("  ✓ Forecast model found")
+        else:
+            print("  ⚠ Forecast model not found, continuing without forecasts")
+    
+    print("Initializing simulator...")
+    _simulator = Simulator(weather_data, forecaster_path=forecaster_path)
+    print(f"  ✓ Turbine: {_simulator.config.turbine.name}")
+    print(f"  ✓ Rated Power: {_simulator.config.turbine.rated_power_kw} kW")
+    if _simulator.forecast_enabled:
+        print("  ✓ Forecast: Enabled")
+    print()
+    
+    _start_time = datetime.now()
+    
+    print("=" * 70)
+    print("Simulator Ready!")
+    print("=" * 70)
+    print()
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="WindTwin Web API Server")
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=1,
+        help="Days of weather data to generate (default: 1)"
+    )
+    parser.add_argument(
+        "--forecast",
+        action="store_true",
+        default=True,
+        help="Enable forecasting (default: True)"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port to run server on (default: 8000)"
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Host to bind to (default: 127.0.0.1)"
+    )
+    
+    args = parser.parse_args()
+    
+    # Initialize simulator
+    initialize_simulator(days=args.days, forecast=args.forecast)
+    
+    # Mount static files for web UI
+    static_path = Path(__file__).parent / "web"
+    if static_path.exists():
+        app.mount("/", StaticFiles(directory=str(static_path), html=True), name="web")
+        print(f"✓ Serving web UI from {static_path}")
+        print()
+    
+    # Start API server
+    print(f"Starting API server on http://{args.host}:{args.port}")
+    print(f"  API Docs: http://{args.host}:{args.port}/docs")
+    print(f"  Web UI:   http://{args.host}:{args.port}/")
+    print()
+    print("Press Ctrl+C to stop")
+    print()
+    
+    # Run server
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="info"
+    )

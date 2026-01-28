@@ -1,0 +1,94 @@
+# WINDTWIN-AI Configuration File
+# Phase 2: Digital Twin Core
+
+# Turbine Specifications
+turbine:
+  name: "Generic 2.5MW Turbine"
+  rated_power_kw: 2500
+  rotor_diameter_m: 90
+  hub_height_m: 80
+  
+  # Operational speeds
+  cut_in_speed_ms: 3.0
+  rated_speed_ms: 12.0
+  cut_out_speed_ms: 25.0
+  
+  # Rotor parameters
+  max_rotor_rpm: 20.0
+  min_rotor_rpm: 0.0
+  rotor_inertia_kgm2: 5000000  # Simplified for Phase 2
+  
+  # Operational limits
+  max_generator_temp_c: 110
+  max_gearbox_temp_c: 100
+  max_bearing_temp_c: 95
+  max_vibration_mms: 8.0
+  
+  # Efficiency parameters
+  power_coefficient: 0.45  # Cp (Betz limit consideration)
+  mechanical_efficiency: 0.95
+  electrical_efficiency: 0.97
+
+# Physics Model (Simplified for Phase 2)
+physics:
+  # Thermal model
+  thermal:
+    generator_thermal_capacity: 50000  # J/K
+    gearbox_thermal_capacity: 40000
+    bearing_thermal_capacity: 20000
+    heat_dissipation_coefficient: 100  # W/K
+    ambient_heat_transfer_rate: 0.05  # Per time step
+  
+  # Mechanical model
+  mechanical:
+    rotor_acceleration_rate: 0.5  # RPM per second
+    rotor_deceleration_rate: 0.3
+    damping_coefficient: 0.1
+
+# Simulation Settings
+simulation:
+  # Time control
+  # v1.0 REALISM FIX: Match real-time loop interval (5 minutes)
+  time_step_seconds: 300  # 5 minutes = 300 seconds (was 10)
+  
+  # Modes
+  default_mode: "realtime"  # realtime, fast, step
+  fast_mode_multipliers: [1, 10, 100, 1000]
+  
+  # State management
+  history_buffer_size: 1000  # Keep last 1000 states
+  
+  # Checkpointing
+  auto_checkpoint_enabled: true
+  auto_checkpoint_interval_minutes: 10
+  max_checkpoints_to_keep: 10
+
+# Dashboard Settings
+dashboard:
+  # Update rate
+  refresh_rate_hz: 1.0
+  
+  # Display settings
+  power_gauge_width: 40
+  show_events_count: 5
+  
+  # Colors (Rich library names)
+  status_colors:
+    running: "green"
+    stopped: "yellow"
+    fault: "red"
+    maintenance: "blue"
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  log_to_file: true
+  log_file: "logs/windtwin.log"
+  max_log_size_mb: 10
+  backup_count: 5
+
+# Data Storage
+storage:
+  simulation_data_dir: "data/simulations"
+  checkpoint_dir: "data/simulations/{sim_id}/checkpoints"
+  export_format: "csv"  # csv, json, parquet

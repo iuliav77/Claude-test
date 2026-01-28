@@ -1,0 +1,18 @@
+{
+  "model_name": "power_forecast_1h",
+  "forecast_horizon_hours": 1,
+  "training_date": "2026-01-28T08:57:07.416320",
+  "training_samples": 742,
+  "num_features": 152,
+  "metrics": {
+    "train_mae": 0.0,
+    "train_rmse": 0.0,
+    "train_r2": 1.0,
+    "train_mape": 0.0,
+    "val_mae": 0.0,
+    "val_rmse": 0.0,
+    "val_r2": 1.0,
+    "val_mape": 0.0
+  },
+  "model_type": "LinearRegression"
+}

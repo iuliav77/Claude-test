@@ -92,7 +92,7 @@ class WeatherGenerator:
         timestamps = pd.date_range(
             start=start,
             periods=periods,
-            freq=f'{interval_minutes}min'
+            freq=f'{interval_minutes}min'  # Use 'min' instead of deprecated 'T'
         )
         
         # Generate wind speed using Weibull distribution

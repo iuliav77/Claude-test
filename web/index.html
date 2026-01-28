@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WindTwin - Turbine Monitoring</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        header {
+            background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+        }
+
+        h1 {
+            font-size: 28px;
+            font-weight: 600;
+            color: #60a5fa;
+            margin-bottom: 5px;
+        }
+
+        .subtitle {
+            color: #94a3b8;
+            font-size: 14px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        .card {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            border: 1px solid #334155;
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #334155;
+        }
+
+        .card-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #f1f5f9;
+        }
+
+        .status-badge {
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .status-running {
+            background: #10b981;
+            color: #fff;
+        }
+
+        .status-stopped {
+            background: #6b7280;
+            color: #fff;
+        }
+
+        .status-fault {
+            background: #ef4444;
+            color: #fff;
+        }
+
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+        }
+
+        .metric-label {
+            color: #94a3b8;
+            font-size: 14px;
+        }
+
+        .metric-value {
+            font-size: 18px;
+            font-weight: 600;
+            color: #f1f5f9;
+        }
+
+        .metric-value.large {
+            font-size: 36px;
+            color: #60a5fa;
+        }
+
+        .metric-value.warning {
+            color: #fbbf24;
+        }
+
+        .metric-value.danger {
+            color: #ef4444;
+        }
+
+        .metric-value.success {
+            color: #10b981;
+        }
+
+        .forecast-card {
+            background: linear-gradient(135deg, #1e3a5f 0%, #2d4a6f 100%);
+        }
+
+        .forecast-delta {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 10px;
+            padding: 10px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 8px;
+        }
+
+        .trend-icon {
+            font-size: 24px;
+        }
+
+        .trend-up {
+            color: #10b981;
+        }
+
+        .trend-down {
+            color: #fbbf24;
+        }
+
+        .trend-stable {
+            color: #94a3b8;
+        }
+
+        .chart-container {
+            position: relative;
+            height: 200px;
+            margin-top: 15px;
+        }
+
+        .events-list {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .event-item {
+            padding: 10px;
+            margin-bottom: 8px;
+            background: #0f172a;
+            border-radius: 6px;
+            border-left: 3px solid #60a5fa;
+        }
+
+        .event-item.warning {
+            border-left-color: #fbbf24;
+        }
+
+        .event-item.error {
+            border-left-color: #ef4444;
+        }
+
+        .event-time {
+            font-size: 11px;
+            color: #64748b;
+            margin-bottom: 4px;
+        }
+
+        .event-message {
+            font-size: 13px;
+            color: #cbd5e1;
+        }
+
+        .maintenance-item {
+            padding: 12px;
+            margin-bottom: 10px;
+            background: #0f172a;
+            border-radius: 6px;
+            border-left: 4px solid;
+        }
+
+        .maintenance-item.critical {
+            border-left-color: #ef4444;
+        }
+
+        .maintenance-item.high {
+            border-left-color: #f97316;
+        }
+
+        .maintenance-item.medium {
+            border-left-color: #fbbf24;
+        }
+
+        .maintenance-item.low {
+            border-left-color: #60a5fa;
+        }
+
+        .maintenance-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 6px;
+        }
+
+        .maintenance-component {
+            font-weight: 600;
+            color: #f1f5f9;
+        }
+
+        .maintenance-priority {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 4px;
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+
+        .priority-critical {
+            background: #ef4444;
+            color: #fff;
+        }
+
+        .priority-high {
+            background: #f97316;
+            color: #fff;
+        }
+
+        .priority-medium {
+            background: #fbbf24;
+            color: #000;
+        }
+
+        .priority-low {
+            background: #60a5fa;
+            color: #fff;
+        }
+
+        .maintenance-message {
+            font-size: 13px;
+            color: #cbd5e1;
+            margin-bottom: 4px;
+        }
+
+        .maintenance-reason {
+            font-size: 12px;
+            color: #94a3b8;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #64748b;
+        }
+
+        .error {
+            padding: 20px;
+            background: #7f1d1d;
+            border-radius: 8px;
+            color: #fca5a5;
+            text-align: center;
+        }
+
+        @keyframes pulse {
+            0%, 100% {
+                opacity: 1;
+            }
+            50% {
+                opacity: 0.5;
+            }
+        }
+
+        .updating {
+            animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🌀 WindTwin - Turbine Monitoring</h1>
+            <p class="subtitle">Real-time digital twin with power forecasting</p>
+        </header>
+
+        <div id="app">
+            <div class="loading">Loading turbine data...</div>
+        </div>
+    </div>
+
+    <script>
+        // API Configuration
+        const API_BASE = window.location.origin;
+        const UPDATE_INTERVAL = 2000; // 2 seconds
+
+        // Global state
+        let powerChart = null;
+        let updateTimer = null;
+
+        // Utility functions
+        function formatNumber(num, decimals = 1) {
+            return num?.toFixed(decimals) || '0.0';
+        }
+
+        function formatTimestamp(ts) {
+            const date = new Date(ts);
+            return date.toLocaleTimeString();
+        }
+
+        function getTrendIcon(trend) {
+            switch(trend) {
+                case 'up': return '↑';
+                case 'down': return '↓';
+                case 'stable': return '→';
+                default: return '?';
+            }
+        }
+
+        function getTrendClass(trend) {
+            return `trend-${trend}`;
+        }
+
+        function getStatusClass(status) {
+            if (status === 'RUNNING' || status === 'RATED_POWER') return 'status-running';
+            if (status === 'STOPPED') return 'status-stopped';
+            return 'status-fault';
+        }
+
+        function getTempClass(temp, limit) {
+            const pct = (temp / limit) * 100;
+            if (pct >= 95) return 'danger';
+            if (pct >= 85) return 'warning';
+            return '';
+        }
+
+        function getVibrationClass(vib) {
+            if (vib >= 7) return 'danger';
+            if (vib >= 5) return 'warning';
+            return '';
+        }
+
+        // API calls
+        async function fetchAPI(endpoint) {
+            const response = await fetch(`${API_BASE}${endpoint}`);
+            if (!response.ok) {
+                throw new Error(`API error: ${response.statusText}`);
+            }
+            return response.json();
+        }
+
+        async function fetchAllData() {
+            const [state, forecast, events, maintenance, history] = await Promise.all([
+                fetchAPI('/api/state/current'),
+                fetchAPI('/api/forecast'),
+                fetchAPI('/api/events?limit=5'),
+                fetchAPI('/api/maintenance'),
+                fetchAPI('/api/state/history?window=1h')
+            ]);
+
+            return { state, forecast, events, maintenance, history };
+        }
+
+        // Render functions
+        function renderPowerCard(state, forecast) {
+            const trend = forecast.trend;
+            const trendIcon = getTrendIcon(trend);
+            const trendClass = getTrendClass(trend);
+
+            return `
+                <div class="card forecast-card">
+                    <div class="card-header">
+                        <div class="card-title">Power Output</div>
+                        <div class="status-badge ${getStatusClass(state.status)}">${state.status}</div>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Current Power</span>
+                        <span class="metric-value large">${formatNumber(state.power_kw, 0)} kW</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Rated Power</span>
+                        <span class="metric-value">2,500 kW</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Capacity Factor</span>
+                        <span class="metric-value">${formatNumber(state.capacity_factor * 100, 1)}%</span>
+                    </div>
+                    
+                    ${forecast.available ? `
+                    <div class="forecast-delta">
+                        <span class="${trendClass} trend-icon">${trendIcon}</span>
+                        <div style="flex: 1;">
+                            <div style="font-size: 14px; color: #94a3b8; margin-bottom: 4px;">1-Hour Forecast</div>
+                            <div style="font-size: 20px; font-weight: 600;">
+                                ${formatNumber(forecast.forecast_power_1h, 0)} kW
+                                <span style="font-size: 14px; color: #94a3b8;">
+                                    (${forecast.delta_kw > 0 ? '+' : ''}${formatNumber(forecast.delta_kw, 0)} kW)
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                    ` : `
+                    <div class="forecast-delta">
+                        <div style="color: #64748b; font-size: 14px;">Forecast generating...</div>
+                    </div>
+                    `}
+                </div>
+            `;
+        }
+
+        function renderStatusCard(state) {
+            return `
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">Turbine Status</div>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Wind Speed</span>
+                        <span class="metric-value">${formatNumber(state.wind_speed_ms)} m/s</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Wind Direction</span>
+                        <span class="metric-value">${formatNumber(state.wind_direction_deg, 0)}°</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Ambient Temp</span>
+                        <span class="metric-value">${formatNumber(state.ambient_temp_c)}°C</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Rotor Speed</span>
+                        <span class="metric-value">${formatNumber(state.rotor_speed_rpm)} RPM</span>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderTemperaturesCard(state) {
+            return `
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">Temperatures</div>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Generator</span>
+                        <span class="metric-value ${getTempClass(state.generator_temp_c, 110)}">
+                            ${formatNumber(state.generator_temp_c)}°C
+                        </span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Gearbox</span>
+                        <span class="metric-value ${getTempClass(state.gearbox_temp_c, 100)}">
+                            ${formatNumber(state.gearbox_temp_c)}°C
+                        </span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Bearing</span>
+                        <span class="metric-value ${getTempClass(state.bearing_temp_c, 90)}">
+                            ${formatNumber(state.bearing_temp_c)}°C
+                        </span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Vibration</span>
+                        <span class="metric-value ${getVibrationClass(state.vibration_mms)}">
+                            ${formatNumber(state.vibration_mms, 2)} mm/s
+                        </span>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderProductionCard(state) {
+            return `
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">Production Metrics</div>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Energy Produced</span>
+                        <span class="metric-value">${formatNumber(state.total_energy_mwh)} MWh</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Operating Hours</span>
+                        <span class="metric-value">${formatNumber(state.operating_hours, 0)} h</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Availability</span>
+                        <span class="metric-value success">${formatNumber(state.availability * 100, 1)}%</span>
+                    </div>
+                    ${state.is_faulted ? `
+                    <div class="metric">
+                        <span class="metric-label">Fault</span>
+                        <span class="metric-value danger">${state.fault_message}</span>
+                    </div>
+                    ` : ''}
+                </div>
+            `;
+        }
+
+        function renderEventsCard(events) {
+            const eventsHTML = events.map(event => `
+                <div class="event-item ${event.severity.toLowerCase()}">
+                    <div class="event-time">${formatTimestamp(event.timestamp)}</div>
+                    <div class="event-message">${event.message}</div>
+                </div>
+            `).join('');
+
+            return `
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">Recent Events</div>
+                    </div>
+                    <div class="events-list">
+                        ${eventsHTML || '<div style="color: #64748b; padding: 20px; text-align: center;">No recent events</div>'}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderMaintenanceCard(maintenance) {
+            if (!maintenance.recommendations || maintenance.recommendations.length === 0) {
+                return `
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">Maintenance</div>
+                        </div>
+                        <div style="color: #10b981; padding: 20px; text-align: center;">
+                            ✓ No maintenance required
+                        </div>
+                    </div>
+                `;
+            }
+
+            const recommendationsHTML = maintenance.recommendations.map(rec => `
+                <div class="maintenance-item ${rec.priority}">
+                    <div class="maintenance-header">
+                        <span class="maintenance-component">${rec.component}</span>
+                        <span class="maintenance-priority priority-${rec.priority}">${rec.priority}</span>
+                    </div>
+                    <div class="maintenance-message">${rec.message}</div>
+                    <div class="maintenance-reason">${rec.reason}</div>
+                </div>
+            `).join('');
+
+            return `
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">Maintenance</div>
+                    </div>
+                    <div style="max-height: 300px; overflow-y: auto;">
+                        ${recommendationsHTML}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderPowerChart(history) {
+            return `
+                <div class="card" style="grid-column: 1 / -1;">
+                    <div class="card-header">
+                        <div class="card-title">Power History (1 Hour)</div>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="powerChart"></canvas>
+                    </div>
+                </div>
+            `;
+        }
+
+        function createPowerChart(history) {
+            const ctx = document.getElementById('powerChart');
+            if (!ctx) return;
+
+            const data = history.data || [];
+            const labels = data.map(d => formatTimestamp(d.timestamp));
+            const powers = data.map(d => d.power_kw);
+
+            if (powerChart) {
+                powerChart.destroy();
+            }
+
+            powerChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Power (kW)',
+                        data: powers,
+                        borderColor: '#60a5fa',
+                        backgroundColor: 'rgba(96, 165, 250, 0.1)',
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: false
+                        }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            grid: {
+                                color: '#334155'
+                            },
+                            ticks: {
+                                color: '#94a3b8'
+                            }
+                        },
+                        x: {
+                            grid: {
+                                color: '#334155'
+                            },
+                            ticks: {
+                                color: '#94a3b8',
+                                maxTicksLimit: 10
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Main render function
+        function render(data) {
+            const { state, forecast, events, maintenance, history } = data;
+
+            const html = `
+                <div class="grid">
+                    ${renderPowerCard(state, forecast)}
+                    ${renderStatusCard(state)}
+                    ${renderTemperaturesCard(state)}
+                    ${renderProductionCard(state)}
+                    ${renderEventsCard(events)}
+                    ${renderMaintenanceCard(maintenance)}
+                </div>
+                ${renderPowerChart(history)}
+            `;
+
+            document.getElementById('app').innerHTML = html;
+            
+            // Create chart after DOM update
+            setTimeout(() => createPowerChart(history), 100);
+        }
+
+        // Update loop
+        async function update() {
+            try {
+                const data = await fetchAllData();
+                render(data);
+            } catch (error) {
+                console.error('Update error:', error);
+                document.getElementById('app').innerHTML = `
+                    <div class="error">
+                        ⚠️ Error loading data: ${error.message}
+                        <br><br>
+                        Make sure the API server is running on port 8000
+                        <br>
+                        <button onclick="location.reload()" style="margin-top: 10px; padding: 8px 16px; background: #ef4444; color: white; border: none; border-radius: 6px; cursor: pointer;">
+                            Retry
+                        </button>
+                    </div>
+                `;
+            }
+        }
+
+        // Start updates
+        function startUpdates() {
+            update(); // Initial update
+            updateTimer = setInterval(update, UPDATE_INTERVAL);
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', startUpdates);
+    </script>
+</body>
+</html>
